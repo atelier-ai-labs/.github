@@ -1,0 +1,60 @@
+# Mission Control watchdog. Lives in the PUBLIC atelier-ai-labs/.github repo, so it is independent of
+# the backend it watches and its scheduled runs are free. A failed run emails the owner (GitHub's default
+# notification for failed workflow runs) until Slack (D1) exists.
+#
+# Every 15 min: shallow GET /healthz (no database query, so Neon stays asleep).
+# Every 2 h (the :07 run of even hours, UTC): /healthz?deep=1 with the health token, which also checks
+# the database and that the 30-minute reconcile ran in the last 75 minutes.
+# Two attempts 90 s apart before failing, so one slow cold start isn't an alert.
+#
+# Repo secrets in atelier-ai-labs/.github: MC_URL (https://<fqdn>), MC_HEALTH_TOKEN.
+#
+# GitHub disables scheduled workflows in a public repo after 60 days without repository activity, and
+# this repo rarely changes. Each run re-enables this workflow through the API, which resets that timer
+# without commits.
+name: Mission Control watchdog
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      deep:
+        description: "Run the deep check"
+        type: boolean
+        default: true
+
+permissions:
+  actions: write   # only to keep this workflow enabled (see above)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Keep this scheduled workflow enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/mission-control-watchdog.yml/enable" --silent
+
+      - name: Check Mission Control health
+        env:
+          MC_URL: ${{ secrets.MC_URL }}
+          TOKEN: ${{ secrets.MC_HEALTH_TOKEN }}
+          FORCE_DEEP: ${{ inputs.deep }}
+        run: |
+          hour=$(date -u +%H); minute=$(date -u +%M)
+          deep=false
+          if [ "$FORCE_DEEP" = "true" ] || { [ $((10#$hour % 2)) -eq 0 ] && [ $((10#$minute)) -lt 15 ]; }; then deep=true; fi
+          for attempt in 1 2; do
+            if [ "$deep" = true ]; then
+              code=$(curl -s -o body.json -w '%{http_code}' --max-time 45 -H "Authorization: Bearer $TOKEN" "$MC_URL/healthz?deep=1")
+            else
+              code=$(curl -s -o body.json -w '%{http_code}' --max-time 45 "$MC_URL/healthz")
+            fi
+            echo "attempt $attempt (deep=$deep): HTTP $code $(cat body.json 2>/dev/null)"
+            [ "$code" = "200" ] && exit 0
+            [ $attempt -eq 1 ] && sleep 90
+          done
+          echo "::error::Mission Control health check failed (deep=$deep, HTTP $code)"
+          exit 1
