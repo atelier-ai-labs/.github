@@ -5,7 +5,9 @@
 # Every 15 min: shallow GET /healthz (no database query, so Neon stays asleep).
 # Every 2 h (the :07 run of even hours, UTC): /healthz?deep=1 with the health token, which also checks
 # the database and that the 30-minute reconcile ran in the last 75 minutes.
-# Two attempts 90 s apart before failing, so one slow cold start isn't an alert.
+# Two attempts 90 s apart before failing, so one slow cold start isn't an alert. A cold start (scale from
+# zero: schedule a replica, pull the image, start Python, connect to Neon) takes ~50 s, so each attempt
+# waits up to 120 s. `|| code=000` keeps a curl timeout from ending the script before the retry (bash -e).
 #
 # Repo secrets in atelier-ai-labs/.github: MC_URL (https://<fqdn>), MC_HEALTH_TOKEN.
 #
@@ -30,7 +32,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Keep this scheduled workflow enabled
         env:
@@ -48,9 +50,9 @@ jobs:
           if [ "$FORCE_DEEP" = "true" ] || { [ $((10#$hour % 2)) -eq 0 ] && [ $((10#$minute)) -lt 15 ]; }; then deep=true; fi
           for attempt in 1 2; do
             if [ "$deep" = true ]; then
-              code=$(curl -s -o body.json -w '%{http_code}' --max-time 45 -H "Authorization: Bearer $TOKEN" "$MC_URL/healthz?deep=1")
+              code=$(curl -s -o body.json -w '%{http_code}' --max-time 120 -H "Authorization: Bearer $TOKEN" "$MC_URL/healthz?deep=1") || code=000
             else
-              code=$(curl -s -o body.json -w '%{http_code}' --max-time 45 "$MC_URL/healthz")
+              code=$(curl -s -o body.json -w '%{http_code}' --max-time 120 "$MC_URL/healthz") || code=000
             fi
             echo "attempt $attempt (deep=$deep): HTTP $code $(cat body.json 2>/dev/null)"
             [ "$code" = "200" ] && exit 0
